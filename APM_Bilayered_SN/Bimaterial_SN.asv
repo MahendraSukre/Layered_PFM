@@ -1,0 +1,289 @@
+clc
+clear; %close all
+setpath
+
+%% PARAMETERS
+
+beta_E  = 0.8;
+beta_G  = 0.8 ;
+alpha_E = (1+beta_E)/(1-beta_E);
+alpha_G = (1+beta_G)/(1-beta_G);
+E1 = 75/(1+alpha_E);
+G1 = 0.002/(1+alpha_G);
+
+% Resolution parameters
+MatTyp = 2;                          % 1 : Homogeneous, 2 : Bi-layered, 3 : Three-layered
+We = alpha_E; Wg = alpha_G;          % We: Stiffness contrast, Wg: Toughness contrast
+BC = 2;                              % 1: Right edge free in Y, 2: L&R both edges free in Y except at (-20,0), else fixed in Y
+degree = 1;  test = 8;               % 1: shear, 3: Lshaped, 5: hole, 8: bimaterials
+dist = 5; m = 0; tol = 1.e-2;
+h  = 1.5; refinementFactor = 8; refinementValue = 0.25;
+dt = 0; tf = 0.2; step  = 1e-3;
+increments = dt:step:tf;
+eta = 1e-6; Gc = G1; l = 0.3; E = E1; nu = 0.25;
+
+% Nitsche parameters
+alphaLE = 100; 
+alphaD = 100;
+betaLE = E*alphaLE/((h/refinementFactor));
+betaD  = Gc*l*alphaD/((h/refinementFactor));
+
+% Phase-field parameters
+lambda = E*nu/((1+nu)*(1-2*nu));
+mu = E/(2*(1+nu));
+
+%% REFERENCE ELEMENTS
+referenceElementStd = createReferenceElement(0,degree);
+referenceElementRef = createReferenceElementQua_hrefined(degree,refinementFactor);
+
+% Loading and extracting mesh information
+
+npx = 41; npy = 41; nen = 4;
+elem = 0;                        % elem : 0 for quadrilaterals, 1 for triangles
+dom = [-20 20 -20 20];           % domain
+[X,T] = CreateMesh(elem,nen,dom,npx,npy);
+nOfElements = size(T,1);
+nOfElementNodes = size(T,2);
+BotElem = 1:nOfElements/2;
+TopElem = nOfElements/2+1:nOfElements;
+
+% Material parameters: constant in every element
+E_elems = E*ones(nOfElements,1); 
+nu_elems = nu*ones(nOfElements,1);
+Gc_elems = Gc*ones(nOfElements,1); 
+l_elems = l*ones(nOfElements,1);
+Gc_elems1 = zeros(nOfElements,1); Gc_elems1(BotElem) = Gc; Gc_elems1(TopElem) = Wg*Gc;
+E_elems1 = zeros(nOfElements,1); E_elems1(BotElem) = E; E_elems1(TopElem) = We*E;
+
+% INITIAL REFINED ZONE
+
+% DG preprocess (identification of faces)
+[F,infoFaces] = hdg_preprocess_twoMeshes(X,T(:,:),referenceElementStd,test); %%%%%%
+nOfFaces = max(max(F));
+nOfExteriorFaces = size(infoFaces.extFaces,1);
+nOfDirichletFaces = size(infoFaces.dirichletFaces,1);
+nOfElementFaces = size(F,2);
+nOfInteriorFaces = nOfFaces - (nOfExteriorFaces-nOfDirichletFaces);
+
+% Elements to refine
+elementsToRefine = [];
+for i = 1:nOfElements
+    Xe = X(T(i,:),:);
+    if (length(find(Xe(:,2)<-16 & (abs(Xe(:,1)) < h))) == size(T,2))
+        elementsToRefine = [elementsToRefine;i];
+    end
+end
+
+[Xref,Tref,NitscheFaces,nodesCCDStd,nodesCCDRef,nodesCCDStdCorrected,nonStdNodes,refinedElements]...
+    = infoRefinedZoneNitscheTwoMeshes(X,T,F,infoFaces,elementsToRefine,referenceElementRef,referenceElementStd);
+
+nonStdNodes_xy = [nonStdNodes, nonStdNodes + size(X,1) + size(Xref,1)];
+stdNodes = setdiff(1:size(X,1), nonStdNodes);
+nDOFStd = length(stdNodes);
+nDOFRef = size(Xref,1);
+nDOF = (nDOFStd + nDOFRef);
+Fix = find(X(nodesCCDStd,1) == -20 & X(nodesCCDStd,2)==0);
+nodesCCD = [nodesCCDStdCorrected, nodesCCDStdCorrected(Fix) + nDOF];
+notCCD = setdiff(1:(2*nDOF),nodesCCD) ;  % actual degrees of freedom(not boundary nodes) % notCCD = activeDof
+d = zeros(size(X,1) + size(Xref,1),1);
+
+% number of refined and standard elements
+nOfRefEls = length(refinedElements);
+nOfStdEls = nOfElements - nOfRefEls;
+
+% number of integration points in refined and standard elements
+nIPref = length(referenceElementRef.IPweights);
+nIPstd = length(referenceElementStd.IPweights);
+
+% initializing history field and incremental load vector
+H_previous = zeros(nIPref*nOfRefEls + nIPstd*nOfStdEls,1);
+loads = zeros(length(increments),1);
+
+% Initial damage band
+nStdEls = nOfElements-length(refinedElements);
+nIPstd = length(referenceElementStd.IPweights);
+nIPref = length(referenceElementRef.IPweights);
+Xgplot = []; Hplot = []; B = 1/1.e-3 - 1;
+w = l; yt = 18;
+nOfIPRefEl = length(referenceElementRef.IPweights);
+for k = 1:length(refinedElements)
+    ielem = refinedElements(k);
+    Te = T(ielem,:); Xe = X(Te,:);
+    Xg = referenceElementRef.NGeo*Xe;
+    for j = 1:size(Xg,1)
+        xg = Xg(j,1); yg = Xg(j,2); Hg = 0;
+        if (abs(xg-0)<w/2 && yg<(-yt))
+            distCrack = abs(xg-0);
+            Hg = B*(Gc/(2*w))*(1-distCrack/(w/2));
+        elseif (sqrt((yg+yt)^2+abs(xg-0)^2)<w/2 && yg >(-yt+1.e-2))
+            distCrack = sqrt((yg+yt)^2+abs(xg-0)^2);
+            Hg = B*(Gc/(2*w))*(1-distCrack/(w/2));
+        end
+        ind = nStdEls*nIPstd + (k-1)*nIPref + j;
+        H_previous(ind) = Hg;
+    end
+end
+Hnn = find(H_previous > 0);
+
+[K,f] = NitscheTwoMeshesDamage_PF(X,T,Xref,Tref,NitscheFaces,refinedElements,referenceElementStd,referenceElementRef,Gc_elems,Gc_elems1,l_elems,betaD,H_previous,Wg,MatTyp,dist);
+K(nonStdNodes,:) = [];
+K(:,nonStdNodes) = [];
+f(nonStdNodes) = [];
+d = K\f;
+
+dStd = d(1:nDOFStd); dRef = d(nDOFStd+1:end);
+d = zeros(size(X,1) + size(Xref,1),1);
+d(setdiff(1:size(X,1),nonStdNodes)) = dStd;
+d(size(X,1)+1:end) = dRef;
+
+%% LOOP IN TIME STEPS
+for ind = 1:length(increments)
+    
+    k = increments(ind);
+    fprintf('\nCurrent applied displacement: %f \n',k)
+
+    s = 0; stoppingCriterion = 0;
+    
+    while (stoppingCriterion == 0)
+        s = s + 1;
+        
+        %% EQUILIBRIUM EQUATION
+        
+        uCCD = dirichletCondition(X, Xref, nodesCCDStd, nodesCCDRef, k, test, BC);
+        
+        [K,f] = NitscheTwoMeshesLinearElasticityDamage_PF(X,T,Xref,Tref,NitscheFaces,refinedElements,...
+                referenceElementStd,referenceElementRef,E_elems,E_elems1,nu_elems,eta,betaLE,d,We,MatTyp,dist);
+       
+        K(nonStdNodes_xy,:) = [];
+        K(:,nonStdNodes_xy) = [];
+        f(nonStdNodes_xy) = [];
+        
+        Kdn = K(nodesCCD,notCCD);              % notCCD = activeDof
+        Kdd = K(nodesCCD,nodesCCD);
+        
+        f = f(notCCD) - K(notCCD,nodesCCD)*uCCD;         
+        K = K(notCCD,notCCD);                  % K(activeDof,activeDof)
+        sol = K\f;
+        
+        u = zeros(2*nDOF,1);  u(notCCD) = sol; u(nodesCCD) = uCCD;
+        ux = u(1:nDOF); uy = u(nDOF+1:end);
+        
+        % reconstruccio ux,uy
+        ux_std = ux(1:nDOFStd);  ux_ref = ux(nDOFStd+1:end);
+        uy_std = uy(1:nDOFStd);  uy_ref = uy(nDOFStd+1:end);
+        
+        ux = zeros(size(X,1) + size(Xref,1),1);  uy = ux;
+        
+        ux(setdiff(1:size(X,1),nonStdNodes)) = ux_std;  ux(size(X,1)+1:end) = ux_ref;
+        uy(setdiff(1:size(X,1),nonStdNodes)) = uy_std;  uy(size(X,1)+1:end) = uy_ref;
+        
+        %% HISTORY FIELD H (en pts d'integracio)
+        H = computeH(X,T,Xref,Tref,refinedElements,referenceElementStd,referenceElementRef,ux,uy,H_previous,E_elems,nu,We,MatTyp,dist);
+        
+        % DAMAGE EQUATION
+        
+        % Computation
+        [K,f] = NitscheTwoMeshesDamage_PF(X,T,Xref,Tref,NitscheFaces,refinedElements,referenceElementStd,...
+                                          referenceElementRef,Gc_elems,Gc_elems1,l_elems,betaD,H,Wg,MatTyp,dist); %%%%%%%%%%%%%%%%
+        K(nonStdNodes,:) = [];
+        K(:,nonStdNodes) = [];
+        f(nonStdNodes)   = [];
+        d = K\f;
+        %dam = find(d<0)
+        
+        % reconstruccio d
+        dStd = d(1:nDOFStd); 
+        dRef = d(nDOFStd+1:end);
+        
+        d = zeros(size(X,1) + size(Xref,1),1);
+        d(setdiff(1:size(X,1),nonStdNodes)) = dStd;
+        d(size(X,1)+1:end) = dRef;
+        
+        if(ismembertol(k,(0.01:0.02:tf)))
+        figure(1),clf,plotDiscontinuosSolutionTwoMeshes(NitscheFaces,referenceElementStd,...
+                        referenceElementRef,refinedElements,X,T,Xref,Tref,d,10); colorbar
+        end
+
+        %% STOPPING CRITERION: segons damage field 
+        if (s == 1)
+            d_previous = d;
+        else
+            errorDamage = computeEuclideanNormRelative(d,d_previous);
+            if (errorDamage < tol)
+                stoppingCriterion = 1;
+            else
+                d_previous = d;
+            end
+            fprintf('      Damage residual at iteration %d, |R|',s-1)    
+            fprintf(' = %.4e \n', errorDamage)                           
+        end
+        
+        %% UPDATE REFINEMENT
+        nodalValues = find(d(1:size(X,1)) > refinementValue);
+        if (nodalValues)
+                                                                   elementsToRefine = [];
+            for i = 1:length(nodalValues)
+                a = nodalValues(i);
+                [elements,aux] = find(T == a);
+                elementsToRefine = [elementsToRefine;elements];
+            end
+            elementsToRefine = unique(elementsToRefine);
+            elementsToRefine = setdiff(elementsToRefine,refinedElements);
+            
+            if (elementsToRefine)
+                fprintf('\nMesh adaptivity in progress... \n')       
+
+            %%% Update refined zone
+[Xref,Tref,NitscheFaces,nodesCCDStd,nodesCCDRef,nodesCCDStdCorrected,nonStdNodes,refinedElements,d,ux,uy,H_previous,~,~]...
+    = updateRefinedZoneNitscheTwoMeshes(X,T,Xref,Tref,F,infoFaces,NitscheFaces,refinedElements,elementsToRefine,...
+      referenceElementRef,referenceElementStd,nodesCCDStd,nodesCCDRef,d,ux,uy,H_previous,test,[],[]);
+                
+         d_previous = d;
+         H = computeH(X,T,Xref,Tref,refinedElements,referenceElementStd,referenceElementRef,ux,uy,H_previous,E_elems,nu,We,MatTyp,dist);
+                
+                nonStdNodes_xy = [nonStdNodes,nonStdNodes+size(X,1)+size(Xref,1)];
+                stdNodes = setdiff(1:size(X,1),nonStdNodes);
+                nDOFStd = length(stdNodes); 
+                nDOFRef = size(Xref,1);
+                nDOF = (nDOFStd+nDOFRef);
+                BC_Std = find(X(nodesCCDStd,1) == -20 & X(nodesCCDStd,2)==0);
+                BC_Ref = find(Xref(nodesCCDRef,1) == -20 & Xref(nodesCCDRef,2)==0);
+                nodesCCD = [nodesCCDStdCorrected,nodesCCDRef+nDOFStd,nodesCCDStdCorrected(BC_Std)+nDOF,nodesCCDRef(BC_Ref)+nDOF+nDOFStd];        
+                notCCD   = setdiff(1:(2*nDOF),nodesCCD); %actual degrees of freedom (not boundary nodes)
+                nOfRefEls = length(refinedElements); 
+                nOfStdEls = nOfElements-nOfRefEls;
+            end
+        end
+    end
+        
+    fprintf('Solve Converged!\n')      
+    stoppingCriterion = 0;
+    H_previous = H;
+    
+    %% LOAD
+    lagrangemultipliers = Kdn*sol + Kdd*uCCD;
+    caresdaltx = find(uCCD > 1.e-5);
+    load = sum(lagrangemultipliers(caresdaltx));
+    loads(ind) = load; 
+    
+%     %% SAVE RESULTS
+%     if(ismembertol(k,saveDisplacements))
+%         structName =  [resultsPath,'k',num2str(k),'.mat'];
+%         struct.increments = increments;
+%         struct.ind = ind;
+%         struct.d = d;
+%         struct.u = [ux,uy] ;
+%         struct.H = H;
+%         struct.loads = loads;
+%         % infoRefinement
+%         struct.Xref = Xref; 
+%         struct.Tref = Tref;
+%         struct.NitscheFaces = NitscheFaces;
+%         struct.refinedElements = refinedElements;
+%         save(structName,'struct');
+%     end
+end
+
+plot(increments,loads,'-','linewidth', 1.5)
+xlabel('Displacement (mm)'); ylabel('Load (kN)')
+save('beta_test.mat')
